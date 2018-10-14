@@ -3,7 +3,7 @@ Lazy Parsing and String comparison for
 [RFC7541](https://tools.ietf.org/html/rfc7541)
 "HPACK Header Compression for HTTP/2".
 
-huffmandata.jl created by Wei Tang:
+huffmandata.jl and hp_huffman_encode created by Wei Tang:
 Copyright (c) 2016: Wei Tang, MIT "Expat" License:
 https://github.com/sorpaas/HPack.jl/blob/master/LICENSE.md
 """
@@ -99,6 +99,38 @@ function Base.iterate(s::Huffman, state::UInt = UInt(0))
 end
 
 
+function hp_huffman_encode(data)
+    out = IOBuffer()
+    current::UInt64 = 0
+    n = 0
+
+    for i = 1:length(data)
+        b = data[i] & 0xFF
+        nbits = HUFFMAN_SYMBOL_TABLE[b + 1, 1]
+        code = HUFFMAN_SYMBOL_TABLE[b + 1, 2]
+
+        current <<= nbits
+        current |= code
+        n += nbits
+
+        while n >= 8
+            n -= 8
+            write(out, UInt8(current >>> n))
+            current = current & ~(current >>> n << n)
+        end
+    end
+
+    if n > 0
+        current <<= (8 - n)
+        current |= (0xFF >>> n)
+        write(out, UInt8(current))
+    end
+
+    return take!(out)
+end
+
+
+
 # HPack Strings
 
 """
@@ -151,8 +183,9 @@ hp_ishuffman(s::HPackString) = hp_ishuffman(@inbounds s.bytes[s.i])
 
 hp_ishuffman(flags::UInt8) = flags & 0b10000000 != 0
 
-@inline hp_length(s::HPackString)::Tuple{UInt,UInt} =
-    hp_integer(s.bytes, s.i, 0b01111111)
+@inline hp_length(bytes, i)::Tuple{UInt,UInt} = hp_integer(bytes, i, 0b01111111)
+
+@inline hp_length(s::HPackString)::Tuple{UInt,UInt} = hp_length(s.bytes, s.i)
 
 Base.length(s::HPackString) =
     hp_ishuffman(s) ? (l = 0; for c in s l += 1 end; l) : hp_length(s)[2]
@@ -192,7 +225,7 @@ function hp_iterate_ascii(bytes, max::UInt, i::UInt)::StrItrReturn
 end
 
 function Base.iterate(s::HPackString, state::StrItrState)::StrItrReturn
-    huf_or_max, i = state 
+    huf_or_max, i = state
     return huf_or_max isa Huffman ? hp_iterate_huffman(huf_or_max, i) :
                                     hp_iterate_ascii(s.bytes, huf_or_max, i)
 end
@@ -248,7 +281,7 @@ end
 
 const StringLike = Union{String, SubString{String}}
 
-function hp_cmp(a::HPackString, b::StringLike) 
+function hp_cmp(a::HPackString, b::StringLike)
     if hp_ishuffman(a)
         return hp_cmp(a, codeunits(b))
     end
@@ -277,8 +310,10 @@ hp_cmp(a::HPackString, b::AbstractString) = hp_cmp(a, (UInt(c) for c in b))
 # Connection State
 
 mutable struct HPackSession
-    names::Vector{HPackString}
-    values::Vector{HPackString}
+    namev::Vector{Vector{UInt8}}
+    namei::Vector{UInt}
+    valuev::Vector{Vector{UInt8}}
+    valuei::Vector{UInt}
     max_table_size::UInt
     table_size::UInt
 end
@@ -286,28 +321,30 @@ end
 function Base.show(io::IO, s::HPackSession)
     println(io, "HPackSession with Table Size $(s.table_size):")
     i = hp_static_max + 1
-    for (n, v) in zip(s.names, s.values)
+    for (n, ni, v, vi) in zip(s.namev, s.namei, s.valuev, s.valuei)
+        n = HPackString(n, ni)
+        v = HPackString(v, vi)
         println(io, "    [$i] $n: $v")
         i += 1
     end
     println(io, "")
 end
 
-HPackSession() = HPackSession([],[],default_max_table_size,0)
+HPackSession() = HPackSession([],[],[],[],default_max_table_size,0)
 
 #https://tools.ietf.org/html/rfc7540#section-6.5.2
 const default_max_table_size = 4096
 
 function set_max_table_size(s::HPackSession, n)
-@show :set_max_table_size, n
     s.max_table_size = n
     purge(s)
 end
 
 function purge(s::HPackSession)
     while s.table_size > s.max_table_size
-        field = pop!(s.names) => pop!(s.values)
-        s.table_size -= hp_field_size(field)
+        namev, namei, = pop!(s.namev), pop!(s.namei)
+        valuev, valuei = pop!(s.valuev), pop!(s.valuei)
+        s.table_size -= hp_field_size(namev, namei, valuev, valuei)
     end
 end
 
@@ -316,25 +353,32 @@ The size of an entry is the sum of its name's length in octets (as
 defined in Section 5.2), its value's length in octets, and 32.
 https://tools.ietf.org/html/rfc7541#section-4.1
 """
-hp_field_size(field) = length(field.first) + 
-                       length(field.second) + 
-                       32
+hp_field_size(namev, namei, valuev, valuei) = hp_length(namev, namei)[2] +
+                                              hp_length(valuev, valuei)[2] +
+                                              32
+# Note this is the non huffman decoded length.
+# See https://github.com/http2/http2-spec/issues/767
+# hp_field_size(field) = length(field.first) +
+#                        length(field.second) +
+#                        32
 
-function Base.pushfirst!(s::HPackSession, field)
-    pushfirst!(s.names, field.first)
-    pushfirst!(s.values, field.second)
-    s.table_size += hp_field_size(field)
+
+function Base.pushfirst!(s::HPackSession, namev, namei, valuev, valuei)
+    pushfirst!(s.namev, namev)
+    pushfirst!(s.namei, namei)
+    pushfirst!(s.valuev, valuev)
+    pushfirst!(s.valuei, valuei)
+    s.table_size += hp_field_size(namev, namei, valuev, valuei)
     purge(s)
 end
 
-get_name(s::HPackSession, i) =
+get_name(s::HPackSession, i)::Tuple{Vector{UInt8}, UInt} =
     i < hp_static_max ? hp_static_names[i] :
-                        s.names[i - hp_static_max]
+                        (i -= hp_static_max; (s.namev[i], s.namei[i]))
 
-get_value(s::HPackSession, i) =
+get_value(s::HPackSession, i)::Tuple{Vector{UInt8}, UInt} =
     i < hp_static_max ? hp_static_values[i] :
-                        s.values[i - hp_static_max]
-
+                        (i -= hp_static_max; (s.valuev[i], s.valuei[i]))
 
 # Header Fields
 
@@ -367,6 +411,8 @@ function hp_field_nexti(buf::Vector{UInt8}, i::UInt, flags::UInt8)::UInt
 
     if int_mask != 0
         i = hp_integer_nexti(buf, i, int_mask, flags)
+    else
+        i += 1
     end
     while string_count > 0
         i = hp_string_nexti(buf, i)
@@ -374,6 +420,9 @@ function hp_field_nexti(buf::Vector{UInt8}, i::UInt, flags::UInt8)::UInt
     end
     return i
 end
+
+hp_field_size(buf::Vector{UInt8}, i::UInt, flags::UInt8)::UInt =
+    hp_field_nexti(buf, i, flags) - i
 
 Base.eltype(::Type{HPackBlock}) = Pair{HPackString, HPackString}
 Base.IteratorSize(::Type{HPackBlock}) = Base.SizeUnknown()
@@ -383,9 +432,11 @@ function Base.iterate(b::HPackBlock, i::UInt=b.i)
         if i > length(b.bytes)
             return nothing
         end
-        f, i = hp_field(b, i)
-        if f != nothing
-            return f, i
+        namev, namei, valuev, valuei, i = hp_field(b, i)
+        if namev != nothing
+            name = HPackString(namev, namei)
+            value = HPackString(valuev, valuei)
+            return (name => value), i
         end
     end
 end
@@ -395,42 +446,50 @@ hp_field(block, i) = hp_field(block, i, @inbounds block.bytes[i])
 function hp_field(block::HPackBlock, i::UInt, flags::UInt8)
 
     buf = block.bytes
+    namev = buf
+    valuev = buf
     int_mask, string_count = hp_field_format(buf, i, flags)
 
     # 6.3 Dynamic Table Size Update #FIXME only allowed in 1st field?
     if int_mask == 0b00011111
-        i, table_size = hp_integer(buf, i, int_mask)
-        set_max_table_size(block.session, table_size)
-        return nothing, i
+        if i > block.j
+            block.j = i
+            i, table_size = hp_integer(buf, i, int_mask)
+            @show table_size
+            set_max_table_size(block.session, table_size)
+        end
+        return nothing, nothing, nothing, nothing, i
     end
 
     local name
     local value
 
+    #@show block.session
     if int_mask != 0
+        #@show int_mask, string_count, flags
         i, idx = hp_integer(buf, i, int_mask)
-        name = get_name(block.session, idx)
+        @assert idx > 0
+        #@show Int(idx)
+        namev, namei = get_name(block.session, idx)
         if string_count == 0
-            value = get_value(block.session, idx)
+            valuev, valuei = get_value(block.session, idx)
         else
-            value = HPackString(buf, i)
+            valuei = i
             i = hp_string_nexti(buf, i)
         end
     else
-        i += 1
-        name = HPackString(buf, i)
-        i = hp_string_nexti(buf, i)
-        value = HPackString(buf, i)
-        i = hp_string_nexti(buf, i)
+        namei = i + 1
+        valuei = hp_string_nexti(buf, namei)
+        i = hp_string_nexti(buf, valuei)
     end
 
     # 6.2.1.  Literal Header Field with Incremental Indexing
     if flags & 0b11000000 == 0b01000000 && i > block.j
         block.j = i
-        pushfirst!(block.session, name => value)
+        #@show :push, HPackString(namev, namei) => HPackString(valuev, valuei)
+        pushfirst!(block.session, namev, namei, valuev, valuei)
     end
-
-    return name => value, i
+    return namev, namei, valuev, valuei, i
 end
 
 function hp_field_format(buf::Vector{UInt8}, i::UInt, flags::UInt8)
@@ -507,134 +566,75 @@ function hp_field_format(buf::Vector{UInt8}, i::UInt, flags::UInt8)
     return int_mask, string_count
 end
 
-const hp_static_names = [HPackString(s) for s in (
-    ":authority",
-    ":method",
-    ":method",
-    ":path",
-    ":path",
-    ":scheme",
-    ":scheme",
-    ":status",
-    ":status",
-    ":status",
-    ":status",
-    ":status",
-    ":status",
-    ":status",
-    "accept-",
-    "accept-encoding",
-    "accept-language",
-    "accept-ranges",
-    "accept",
-    "access-control-allow-origin",
-    "age",
-    "allow",
-    "authorization",
-    "cache-control",
-    "content-disposition",
-    "content-encoding",
-    "content-language",
-    "content-length",
-    "content-location",
-    "content-range",
-    "content-type",
-    "cookie",
-    "date",
-    "etag",
-    "expect",
-    "expires",
-    "from",
-    "host",
-    "if-match",
-    "if-modified-since",
-    "if-none-match",
-    "if-range",
-    "if-unmodified-since",
-    "last-modified",
-    "link",
-    "location",
-    "max-forwards",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "range",
-    "referer",
-    "refresh",
-    "retry-after",
-    "server",
-    "set-cookie",
-    "strict-transport-security",
-    "transfer-encoding",
-    "user-agent",
-    "vary",
-    "via",
-    "www-authenticate"
-)]
+const hp_static_strings = [
+    ":authority" => "",
+    ":method" => "GET",
+    ":method" => "POST",
+    ":path" => "/",
+    ":path" => "/index.html",
+    ":scheme" => "http",
+    ":scheme" => "https",
+    ":status" => "200",
+    ":status" => "204",
+    ":status" => "206",
+    ":status" => "304",
+    ":status" => "400",
+    ":status" => "404",
+    ":status" => "500",
+    "accept-" => "",
+    "accept-encoding" => "gzip, deflate",
+    "accept-language" => "",
+    "accept-ranges" => "",
+    "accept" => "",
+    "access-control-allow-origin" => "",
+    "age" => "",
+    "allow" => "",
+    "authorization" => "",
+    "cache-control" => "",
+    "content-disposition" => "",
+    "content-encoding" => "",
+    "content-language" => "",
+    "content-length" => "",
+    "content-location" => "",
+    "content-range" => "",
+    "content-type" => "",
+    "cookie" => "",
+    "date" => "",
+    "etag" => "",
+    "expect" => "",
+    "expires" => "",
+    "from" => "",
+    "host" => "",
+    "if-match" => "",
+    "if-modified-since" => "",
+    "if-none-match" => "",
+    "if-range" => "",
+    "if-unmodified-since" => "",
+    "last-modified" => "",
+    "link" => "",
+    "location" => "",
+    "max-forwards" => "",
+    "proxy-authenticate" => "",
+    "proxy-authorization" => "",
+    "range" => "",
+    "referer" => "",
+    "refresh" => "",
+    "retry-after" => "",
+    "server" => "",
+    "set-cookie" => "",
+    "strict-transport-security" => "",
+    "transfer-encoding" => "",
+    "user-agent" => "",
+    "vary" => "",
+    "via" => "",
+    "www-authenticate" => ""
+]
 
-const hp_static_values = [HPackString(s) for s in (
-    "",
-    "GET",
-    "POST",
-    "/",
-    "/index.html",
-    "http",
-    "https",
-    "200",
-    "204",
-    "206",
-    "304",
-    "400",
-    "404",
-    "500",
-    "",
-    "gzip, deflate",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    "",
-    ""
-)]
+const hp_static_max = length(hp_static_strings)
+const hp_static_names = [(HPackString(n).bytes, 1)
+                         for (n, v) in hp_static_strings]
+const hp_static_values = [(HPackString(v).bytes, 1)
+                          for (n, v) in hp_static_strings]
 
-const hp_static_max = length(hp_static_names)
 
 end # module HPack
