@@ -12,6 +12,8 @@ function hexdump(s)
     end
 end
 
+#@testset "HPack" begin
+
 @testset "HPack.integer" begin
 
 
@@ -381,7 +383,16 @@ end # @testset HPack.fields
 # See https://github.com/http2jp/hpack-test-case
 url = "https://raw.githubusercontent.com/http2jp/hpack-test-case/master"
 
-test_case(name) = LazyJSON.value(HTTP.get("$url/$name").body)
+cachedir() = joinpath(@__DIR__, "http2jp")
+cachehas(file) = isfile(joinpath(cachedir(), file))
+cacheget(file) = read(joinpath(cachedir(), file))
+
+function cacheput(file, data)
+    p = joinpath(cachedir(), file)
+    mkpath(dirname(p))
+    write(p, data)
+end
+
 
 for group in [
     "go-hpack",
@@ -399,9 +410,24 @@ for group in [
 ]
     @testset "HPack.http2jp.$group" begin
         for name in ("$group/story_$(lpad(n, 2, '0')).json" for n in 0:31)
-            tc = test_case(name)
-            #println(tc.description)
+            if cachehas(name)
+                tc = cacheget(name)
+            else
+                tc = try
+                    HTTP.get("$url/$name").body
+                catch e
+                    if e isa HTTP.StatusError && e.status == 404
+                        println("$name 404 not found")
+                        tc = "{\"cases\":[]}"
+                    else
+                        rethrow(w)
+                    end
+                end
+                cacheput(name, tc)
+            end
             @testset "HPack.http2jp.$group.$name" begin
+                tc = LazyJSON.value(tc)
+                #println(tc.description)
                 s = HPack.HPackSession()
                 for case in tc.cases
                     if haskey(case, "header_table_size")
@@ -417,3 +443,4 @@ for group in [
     end
 end
 
+#end # @testset HPack

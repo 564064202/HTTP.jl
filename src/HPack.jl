@@ -455,7 +455,6 @@ function hp_field(block::HPackBlock, i::UInt, flags::UInt8)
         if i > block.j
             block.j = i
             i, table_size = hp_integer(buf, i, int_mask)
-            @show table_size
             set_max_table_size(block.session, table_size)
         end
         return nothing, nothing, nothing, nothing, i
@@ -464,12 +463,9 @@ function hp_field(block::HPackBlock, i::UInt, flags::UInt8)
     local name
     local value
 
-    #@show block.session
     if int_mask != 0
-        #@show int_mask, string_count, flags
         i, idx = hp_integer(buf, i, int_mask)
         @assert idx > 0
-        #@show Int(idx)
         namev, namei = get_name(block.session, idx)
         if string_count == 0
             valuev, valuei = get_value(block.session, idx)
